@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve and validate tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Release tags must match vX.Y.Z (for example v1.2.3)"
+            exit 1
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Require a commit on main
+        shell: bash
+        run: |
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::Release tag must point to a commit already on main"
+            exit 1
+          }
+
+      - name: Verify versions and updater configuration
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          package_version="$(jq -r '.version // empty' package.json)"
+          tauri_version="$(jq -r '.version // empty' src-tauri/tauri.conf.json)"
+          cargo_version="$(python3 - <<'PY'
+          import tomllib
+          with open('src-tauri/Cargo.toml', 'rb') as f:
+              manifest = tomllib.load(f)
+          print(manifest.get('package', {}).get('version', ''))
+          PY
+          )"
+
+          if [[ "$version" != "$package_version" || "$version" != "$tauri_version" || "$version" != "$cargo_version" ]]; then
+            echo "::error::Version mismatch: tag=$version package=$package_version tauri=$tauri_version cargo=$cargo_version"
+            exit 1
+          fi
+
+          if ! jq -e '
+            (.plugins.updater.pubkey | type == "string" and length > 20) and
+            (.plugins.updater.endpoints | type == "array" and length > 0 and all(.[]; type == "string" and startswith("https://")))
+          ' src-tauri/tauri.conf.json > /dev/null; then
+            echo "::error::Configure a real Tauri updater pubkey and HTTPS endpoints before releasing"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and draft Windows release
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: x86_64-pc-windows-msvc
+          cache: false
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-release
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Require Tauri signing credentials
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Set the TAURI_SIGNING_PRIVATE_KEY repository secret before releasing.'
+          }
+
+      # Tauri's updater signature is mandatory. Windows Authenticode signing
+      # is separate and enabled if a PFX certificate is provided.
+      - name: Prepare release configuration and optional Windows certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          if ($hasCertificate -xor $hasPassword) {
+            throw 'Set both WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD, or neither.'
+          }
+
+          $config = @{ bundle = @{ createUpdaterArtifacts = $true } }
+          if ($hasCertificate) {
+            $pfxPath = Join-Path $env:RUNNER_TEMP 'siren-alert-signing.pfx'
+            try {
+              $bytes = [Convert]::FromBase64String(($env:WINDOWS_CERTIFICATE -replace '\s', ''))
+              [IO.File]::WriteAllBytes($pfxPath, $bytes)
+              $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+              $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+                Where-Object HasPrivateKey | Select-Object -First 1
+              if (-not $certificate) {
+                throw 'The Windows PFX did not contain a usable signing certificate.'
+              }
+              $config.bundle.windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = 'sha256'
+                timestampUrl = 'http://timestamp.digicert.com'
+              }
+            }
+            finally {
+              Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $config | ConvertTo-Json -Depth 6 | Set-Content tauri.release.conf.json -Encoding utf8
+
+      - name: Build, sign, and upload to a draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: bun tauri
+          tagName: ${{ needs.validate.outputs.tag }}
+          releaseName: Siren Alert ${{ needs.validate.outputs.tag }}
+          releaseBody: |
+            Windows x64 installer for Siren Alert.
+
+            Updates are signed and verified by Tauri 2.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          args: --target x86_64-pc-windows-msvc --bundles nsis --config tauri.release.conf.json
+
+      - name: Verify draft release and updater manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json isDraft,assets | ConvertFrom-Json
+          if (-not $release.isDraft) { throw 'The release is not a draft.' }
+          $names = @($release.assets | ForEach-Object { $_.name })
+          if ($names -notcontains 'latest.json') { throw 'Missing latest.json updater manifest.' }
+          if (@($names | Where-Object { $_ -match '\.exe$' }).Count -eq 0) { throw 'Missing NSIS installer.' }
+          if (@($names | Where-Object { $_ -match '\.exe\.sig$' }).Count -eq 0) { throw 'Missing Tauri signature.' }
+
+          $directory = Join-Path $env:RUNNER_TEMP 'siren-alert-release-verification'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern latest.json --dir $directory
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download latest.json.' }
+          $manifest = Get-Content (Join-Path $directory 'latest.json') -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $env:VERSION) { throw 'Updater manifest version does not match the release tag.' }
+          $windows = $manifest.platforms.'windows-x86_64'
+          if (-not $windows -or -not $windows.signature -or -not $windows.url) {
+            throw 'Missing Windows x64 updater URL or inline signature.'
+          }
+          if (-not $windows.url.StartsWith("https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/")) {
+            throw 'Updater download URL does not point to this release.'
+          }

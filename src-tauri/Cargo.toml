@@ -1,0 +1,49 @@
+[package]
+name = "siren-alert"
+version = "0.1.0"
+description = "Siren Alert desktop emergency notifications"
+authors = ["orielhaim"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "siren_alert_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+sioc = "0.5"
+rustls = { version = "0.23", features = ["ring"] }
+url = "2"
+reqwest = { version = "0.13", features = ["json", "query"] }
+keyring = "4.2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+rodio = { version = "0.23", default-features = false, features = [
+  "playback",
+  "symphonia-all",
+] }
+rfd = "0.18.0"
+uuid = { version = "1.29.2", features = ["v4"] }
+tauri-plugin-opener = "2.7.2"
+chrono = "0.4.45"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
