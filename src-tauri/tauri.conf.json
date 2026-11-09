@@ -49,6 +49,18 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUyMTk2QzlFQTUzMDlDNDAKUldSQW5EQ2xubXdaVXF1M2I3UDh0VmdSR05XTm9JRW53ZTNXVGxSdXliaXhBTlUybWZZb1F0MDQK",
+      "endpoints": [
+        "https://github.com/orielhaim/siren-alert/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
