@@ -201,7 +201,20 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $release = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json isDraft,assets | ConvertFrom-Json
+          function Test-UpdaterAssetUrl {
+            param([string]$Url, [object[]]$Assets)
+            foreach ($asset in $Assets) {
+              if ($asset.name -match '\.exe$' -and
+                  (($Url -ceq $asset.apiUrl) -or ($Url -ceq $asset.url))) {
+                return $true
+              }
+            }
+            return $false
+          }
+
+          $release = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the release.' }
+          if ($release.tagName -cne $env:TAG) { throw 'Release tag does not match the requested tag.' }
           if (-not $release.isDraft) { throw 'The release is not a draft.' }
           $names = @($release.assets | ForEach-Object { $_.name })
           if ($names -notcontains 'latest.json') { throw 'Missing latest.json updater manifest.' }
@@ -218,6 +231,6 @@ jobs:
           if (-not $windows -or -not $windows.signature -or -not $windows.url) {
             throw 'Missing Windows x64 updater URL or inline signature.'
           }
-          if (-not $windows.url.StartsWith("https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/")) {
+          if (-not (Test-UpdaterAssetUrl -Url $windows.url -Assets $release.assets)) {
             throw 'Updater download URL does not point to this release.'
           }

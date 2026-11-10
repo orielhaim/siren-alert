@@ -67,6 +67,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
+      - name: Test release manifest validation
+        run: bun test tests/release-manifest.test.ts
+
       - name: Test Rust library
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
